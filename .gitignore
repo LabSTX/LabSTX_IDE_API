@@ -1,0 +1,8 @@
+/casper-rust-sdk
+/.env
+
+IDE/.env
+
+node_modules
+discovery-project
+
