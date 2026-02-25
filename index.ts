@@ -386,8 +386,32 @@ app.get('/ide-api/auth/github', (req, res) => {
     const clientId = process.env.GITHUB_CLIENT_ID;
     if (!clientId) return res.status(500).json({ error: 'GitHub OAuth not configured' });
 
-    const frontendUrl = process.env.FRONTEND_URL || (req.headers.origin) || 'http://localhost:3000';
-    const redirectUri = `${process.env.VERCEL_URL ? 'https://' + process.env.VERCEL_URL : frontendUrl}/ide-api/auth/github/callback`;
+    let frontendUrl = process.env.FRONTEND_URL;
+
+    // fallbacks if FRONTEND_URL is not set
+    if (!frontendUrl) {
+        if (req.headers['x-forwarded-host']) {
+            const proto = req.headers['x-forwarded-proto'] || 'https';
+            frontendUrl = `${proto}://${req.headers['x-forwarded-host']}`;
+        } else if (req.headers.referer) {
+            const url = new URL(req.headers.referer);
+            frontendUrl = `${url.protocol}//${url.host}`;
+        } else {
+            frontendUrl = 'http://localhost:3000';
+        }
+    }
+
+    // Sanitize: Remove trailing slash and any path components
+    try {
+        const url = new URL(frontendUrl);
+        frontendUrl = `${url.protocol}//${url.host}`;
+    } catch (e) {
+        frontendUrl = frontendUrl.replace(/\/$/, '');
+    }
+
+    const redirectUri = `${frontendUrl}/ide-api/auth/github/callback`;
+    console.log(`[Auth] Initiating GitHub login. Redirect URI: ${redirectUri}`);
+
     const scope = 'read:user user:email repo gist';
     const githubAuthUrl = `https://github.com/login/oauth/authorize?client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${encodeURIComponent(scope)}`;
     res.redirect(githubAuthUrl);
