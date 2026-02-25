@@ -15,7 +15,14 @@ dotenv.config();
 const __apiDir = path.dirname(fileURLToPath(import.meta.url));
 const execPromise = promisify(exec);
 const app = express();
-app.use(cors());
+app.use(
+    cors({
+        origin: [
+            "http://localhost:3000",
+            "https://lab-stx-ide.vercel.app",
+        ],
+    })
+);
 app.use(express.json());
 app.use(cookieParser());
 
