@@ -386,7 +386,8 @@ app.get('/ide-api/auth/github', (req, res) => {
     const clientId = process.env.GITHUB_CLIENT_ID;
     if (!clientId) return res.status(500).json({ error: 'GitHub OAuth not configured' });
 
-    const redirectUri = `${process.env.VERCEL_URL ? 'https://' + process.env.VERCEL_URL : 'http://localhost:3000'}/ide-api/auth/github/callback`;
+    const frontendUrl = process.env.FRONTEND_URL || (req.headers.origin) || 'http://localhost:3000';
+    const redirectUri = `${process.env.VERCEL_URL ? 'https://' + process.env.VERCEL_URL : frontendUrl}/ide-api/auth/github/callback`;
     const scope = 'read:user user:email repo gist';
     const githubAuthUrl = `https://github.com/login/oauth/authorize?client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${encodeURIComponent(scope)}`;
     res.redirect(githubAuthUrl);
@@ -423,7 +424,9 @@ app.get('/ide-api/auth/github/callback', async (req, res) => {
 
         const encodedCookie = Buffer.from(cookieValue).toString('base64');
         res.setHeader('Set-Cookie', `github_auth=${encodedCookie}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800`);
-        res.redirect('http://localhost:3000/');
+
+        const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+        res.redirect(frontendUrl);
     } catch (error) {
         console.error('GitHub OAuth error:', error);
         res.redirect('/?error=oauth_failed');
@@ -432,7 +435,8 @@ app.get('/ide-api/auth/github/callback', async (req, res) => {
 
 app.get('/ide-api/auth/logout', (req, res) => {
     res.setHeader('Set-Cookie', 'github_auth=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
-    res.redirect('http://localhost:3000/');
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+    res.redirect(frontendUrl);
 });
 
 // --- GitHub API Proxy Routes ---
