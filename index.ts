@@ -9,6 +9,8 @@ import dotenv from 'dotenv';
 import cookieParser from 'cookie-parser';
 import fetch from 'node-fetch';
 import { fileURLToPath } from 'url';
+import multer from 'multer';
+import AdmZip from 'adm-zip';
 
 dotenv.config();
 
@@ -29,9 +31,17 @@ app.use(cookieParser());
 const PORT = 5001;
 const DEPLOYER = 'ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM';
 
+const WORKSPACE_PREFIX = 'lab-stx-';
+const MAX_IDLE_TIME_MS = 15 * 60 * 1000; // 15 minutes
+const upload = multer({ dest: os.tmpdir() });
+
+const getWorkspacePath = (sessionId: string) => {
+    const cleanId = sessionId.replace(/[^a-zA-Z0-9_-]/g, '');
+    return path.join(os.tmpdir(), `${WORKSPACE_PREFIX}${cleanId}`);
+};
+
 // Storage for REPL history per session
 const replHistory: string[] = [];
-let activeContract: { name: string; code: string } | null = null;
 
 // Determine the path to the Clarinet binary
 const getClarinetPath = () => {
@@ -50,112 +60,269 @@ const getClarinetPath = () => {
 const CLARINET_CMD = getClarinetPath();
 console.log(`[CLI] Using Clarinet command: ${CLARINET_CMD}`);
 
-/**
- * Creates a temporary Clarinet project for a specific operation
- */
-async function createTempProject(contracts: { name: string; code: string }[]) {
-    const root = path.join(os.tmpdir(), `clarinet-${Date.now()}`);
-    fs.mkdirSync(root, { recursive: true });
-    fs.mkdirSync(path.join(root, 'contracts'));
-    fs.mkdirSync(path.join(root, 'settings'));
-
-    // Create Clarinet.toml
-    let clarinetToml = `[project]\nname = "temp-project"\nauthors = []\ndescription = ""\ntelemetry = false\n[repl]\ncosts_version = 2\npurify_stack = true\nshow_costs = false\n`;
-
-    for (const contract of contracts) {
-        const cleanName = contract.name.replace(/\.clar$/, '');
-        const contractPath = path.join('contracts', `${cleanName}.clar`);
-        fs.writeFileSync(path.join(root, contractPath), contract.code);
-
-        clarinetToml += `\n[contracts.${cleanName}]\npath = "${contractPath.replace(/\\/g, '/')}"\nsummary = ""\ndepends_on = []\n`;
-    }
-
-    fs.writeFileSync(path.join(root, 'Clarinet.toml'), clarinetToml);
-
-    // Use the official Clarinet 3.4.0 default mnemonic (24 words)
-    const simnetToml = `[network]\nname = "simnet"\n\n[accounts.deployer]\nmnemonic = "twice kind fence tip hidden tilt action fragile skin nothing glory cousin green tomorrow spring wrist shed math olympic multiply hip blue scout claw"\nbalance = 100000000000000\n\n[accounts.wallet_1]\nmnemonic = "sell invite acquire kitten bamboo drastic jelly vivid peace spawn twice guilt pave pen trash pretty park cube fragile unaware remain midnight betray rebuild"\nbalance = 100000000000000`;
-
-    fs.writeFileSync(path.join(root, 'settings', 'Simnet.toml'), simnetToml);
-    fs.writeFileSync(path.join(root, 'settings', 'Devnet.toml'), simnetToml);
-
-    return root;
-}
-
 // 1. Health Check
 app.get('/ide-api/health', (req, res) => {
     res.json({ status: 'ok', engine: 'Clarinet CLI' });
 });
 
-// 2. Check Contract (Using clarinet check)
-app.post('/ide-api/clarity/check', async (req, res) => {
-    const { code, name } = req.body;
-    let projectDir = '';
+// 1.5 Init Project
+app.post('/ide-api/project/init', upload.single('workspace'), async (req, res) => {
+    const sessionId = req.body.sessionId;
+    if (!sessionId) return res.status(400).json({ error: 'Missing sessionId' });
+    if (!req.file) return res.status(400).json({ error: 'Missing workspace zip' });
+
+    const workspaceDir = getWorkspacePath(sessionId);
+
     try {
-        projectDir = await createTempProject([{ name, code }]);
-        console.log(`[CLI] Running check for ${name}...`);
+        if (fs.existsSync(workspaceDir)) {
+            fs.rmSync(workspaceDir, { recursive: true, force: true });
+        }
+        fs.mkdirSync(workspaceDir, { recursive: true });
 
-        let success = true;
-        let output = "";
-        let errors: string[] = [];
+        const zip = new AdmZip(req.file.path);
+        zip.extractAllTo(workspaceDir, true);
 
-        try {
-            const { stdout, stderr } = await execPromise(`${CLARINET_CMD} check`, { cwd: projectDir });
-            // Combine stdout and stderr for a full terminal-like log
-            output = (stdout || "") + (stderr || "");
-            success = true;
-        } catch (err: any) {
-            success = false;
-            output = (err.stdout || "") + (err.stderr || "");
-            const errLines = output.split('\n')
-                .filter((l: string) => l.includes('error:') || l.includes('syntax error'));
-            errors = errLines.length > 0 ? errLines : [err.message || "Check failed"];
+        // Clean up uploaded zip
+        fs.unlinkSync(req.file.path);
+
+        // Fix GitHub zip structure (if there's exactly one root folder, move its contents up)
+        const entries = fs.readdirSync(workspaceDir);
+        if (entries.length === 1) {
+            const possibleRoot = path.join(workspaceDir, entries[0]);
+            if (fs.statSync(possibleRoot).isDirectory()) {
+                const innerEntries = fs.readdirSync(possibleRoot);
+                for (const entry of innerEntries) {
+                    fs.renameSync(path.join(possibleRoot, entry), path.join(workspaceDir, entry));
+                }
+                fs.rmdirSync(possibleRoot);
+            }
         }
 
-        res.json({ success, output, errors });
-    } catch (error: any) {
-        res.status(500).json({ success: false, errors: [error.message || "Internal server error"] });
-    } finally {
-        if (projectDir) fs.rmSync(projectDir, { recursive: true, force: true });
+        // Ensure Clarinet.toml exists
+        const tomlPath = path.join(workspaceDir, 'Clarinet.toml');
+        if (!fs.existsSync(tomlPath)) {
+            let clarinetToml = `[project]\nname = "labstx-project"\nauthors = []\ntelemetry = false\nrequirements = []\n[repl]\ncosts_version = 2\nparser_version = 2\n\n`;
+
+            // Auto-detect contracts
+            const contractsDir = path.join(workspaceDir, 'contracts');
+            if (fs.existsSync(contractsDir)) {
+                clarinetToml += "[contracts]\n";
+                const files = fs.readdirSync(contractsDir);
+                files.forEach(f => {
+                    if (f.endsWith('.clar')) {
+                        const cleanName = f.replace(/\.clar$/, '');
+                        clarinetToml += `\n[contracts.${cleanName}]\npath = "contracts/${f}"\ndepends_on = []\n`;
+                    }
+                });
+            }
+            fs.writeFileSync(tomlPath, clarinetToml);
+        }
+
+        const settingsDir = path.join(workspaceDir, 'settings');
+        if (!fs.existsSync(settingsDir)) {
+            fs.mkdirSync(settingsDir, { recursive: true });
+            const simnetToml = `[network]\nname = "simnet"\n[accounts.deployer]\nmnemonic = "twice kind fence tip hidden tilt action fragile skin nothing glory cousin green tomorrow spring wrist shed math olympic multiply hip blue scout claw"\nbalance = 100000000000000\n[accounts.wallet_1]\nmnemonic = "sell invite acquire kitten bamboo drastic jelly vivid peace spawn twice guilt pave pen trash pretty park cube fragile unaware remain midnight betray rebuild"\nbalance = 100000000000000`;
+            fs.writeFileSync(path.join(settingsDir, 'Simnet.toml'), simnetToml);
+            fs.writeFileSync(path.join(settingsDir, 'Devnet.toml'), simnetToml);
+        }
+
+        console.log(`[CLI] Initialized workspace ${workspaceDir} for session ${sessionId}, running check...`);
+        const { stdout, stderr } = await execPromise(`${CLARINET_CMD} check`, { cwd: workspaceDir });
+        const output = (stdout || "") + (stderr || "");
+
+        const now = new Date();
+        fs.utimesSync(workspaceDir, now, now);
+
+        res.json({ success: true, output, errors: [] });
+    } catch (err: any) {
+        let output = (err.stdout || "") + (err.stderr || "");
+        const errLines = output.split('\n').filter((l: string) => l.includes('error:') || l.includes('syntax error'));
+        const errors = errLines.length > 0 ? errLines : [err.message || "Init failed"];
+        res.status(500).json({ success: false, output, errors });
     }
 });
 
-// 3. Deploy (Update Context)
-app.post('/ide-api/clarity/deploy', async (req, res) => {
-    const { code, name } = req.body;
-    activeContract = { name, code };
-    console.log(`[CLI] Updated active contract context: ${name}`);
-    res.json({ success: true });
+// 1.6 Update Project
+app.post('/ide-api/project/update', async (req, res) => {
+    const { sessionId, changedFiles } = req.body;
+
+    if (!sessionId) return res.status(400).json({ error: 'Missing sessionId' });
+
+    const workspaceDir = getWorkspacePath(sessionId);
+
+    if (!fs.existsSync(workspaceDir)) {
+        return res.status(404).json({ error: 'Workspace expired. Please run a full sync.' });
+    }
+
+    try {
+        if (changedFiles) {
+            for (const [filePath, content] of Object.entries(changedFiles)) {
+                // SECURITY: Ensure the file path doesn't escape the workspace directory
+                const safeRelativePath = path.normalize(filePath).replace(/^(\.\.(\/|\\|$))+/, '');
+                const absolutePath = path.join(workspaceDir, safeRelativePath);
+
+                fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
+                fs.writeFileSync(absolutePath, content as string);
+            }
+        }
+
+        if (req.body.deletedPaths && Array.isArray(req.body.deletedPaths)) {
+            for (const filePath of req.body.deletedPaths) {
+                const safeRelativePath = path.normalize(filePath).replace(/^(\.\.(\/|\\|$))+/, '');
+                const absolutePath = path.join(workspaceDir, safeRelativePath);
+                if (fs.existsSync(absolutePath)) {
+                    fs.rmSync(absolutePath, { recursive: true, force: true });
+                }
+            }
+        }
+
+        console.log(`[CLI] Applied deltas for session ${sessionId}, running check...`);
+        const { stdout, stderr } = await execPromise(`${CLARINET_CMD} check`, { cwd: workspaceDir });
+        const output = (stdout || "") + (stderr || "");
+
+        const now = new Date();
+        fs.utimesSync(workspaceDir, now, now);
+
+        res.json({ success: true, output, errors: [] });
+    } catch (err: any) {
+        let output = (err.stdout || "") + (err.stderr || "");
+        const errLines = output.split('\n').filter((l: string) => l.includes('error:') || l.includes('syntax error'));
+        const errors = errLines.length > 0 ? errLines : [err.message || "Update failed"];
+        res.status(500).json({ success: false, output, errors });
+    }
+});
+
+// 1.7 Clear Session (Delete Workspace)
+app.post('/ide-api/project/session/clear', async (req, res) => {
+    const { sessionId } = req.body;
+    if (!sessionId) return res.status(400).json({ error: 'Missing sessionId' });
+
+    const workspaceDir = getWorkspacePath(sessionId);
+
+    try {
+        if (fs.existsSync(workspaceDir)) {
+            fs.rmSync(workspaceDir, { recursive: true, force: true });
+            console.log(`[CLI] Cleared workspace for session: ${sessionId}`);
+        }
+        res.json({ success: true, message: 'Session cleared' });
+    } catch (err: any) {
+        res.status(500).json({ success: false, error: err.message || 'Clear failed' });
+    }
+});
+
+// 1.8 Fetch Workspace Files (Sync from Server to IDE)
+app.get('/ide-api/project/files/:sessionId', async (req, res) => {
+    const { sessionId } = req.params;
+    if (!sessionId) return res.status(400).json({ error: 'Missing sessionId' });
+
+    const workspaceDir = getWorkspacePath(sessionId);
+    if (!fs.existsSync(workspaceDir)) {
+        return res.status(404).json({ error: 'SERVER_WORKSPACE_EXPIRED', message: 'The server-side workspace has been cleared. Please click "Check/Compile" to re-initialize it.' });
+    }
+
+    try {
+        const fileContents: Record<string, string> = {};
+
+        const traverse = (dir: string, relativePath: string = '') => {
+            const items = fs.readdirSync(dir);
+            for (const item of items) {
+                const fullPath = path.join(dir, item);
+                const relPath = relativePath ? path.join(relativePath, item).replace(/\\/g, '/') : item;
+
+                // Skip node_modules, .git, and common build/cache dirs
+                if (['node_modules', '.git', 'target', '.coverage'].includes(item)) continue;
+
+                if (fs.statSync(fullPath).isDirectory()) {
+                    traverse(fullPath, relPath);
+                } else {
+                    // Only read text-based source files for the IDE
+                    if (/\.(clar|toml|md|txt|json|js|ts|tsx|yaml|yml|css|html)$/i.test(item)) {
+                        fileContents[relPath] = fs.readFileSync(fullPath, 'utf8');
+                    }
+                }
+            }
+        };
+
+        traverse(workspaceDir);
+        res.json({ success: true, files: fileContents });
+    } catch (err: any) {
+        res.status(500).json({ success: false, error: err.message || 'Failed to fetch files' });
+    }
 });
 
 // 4. Execute Expression (Using clarinet console pipe)
 app.post('/ide-api/clarity/execute', async (req, res) => {
-    const { snippet } = req.body;
-    let projectDir = '';
-    try {
-        const contracts = activeContract ? [activeContract] : [];
-        projectDir = await createTempProject(contracts);
+    const { snippet, sessionId } = req.body;
+    if (!sessionId) return res.status(400).json({ error: 'Missing sessionId' });
 
+    const workspaceDir = getWorkspacePath(sessionId);
+    if (!fs.existsSync(workspaceDir)) {
+        return res.status(404).json({ error: 'Workspace expired. Please run a full sync.' });
+    }
+
+    try {
         // Include simple trace/assets collection
         const script = [...replHistory, snippet].join('\n') + '\n::get_assets\n';
-        const scriptPath = path.join(projectDir, 'repl_input.clar');
+        const scriptPath = path.join(workspaceDir, 'repl_input.clar');
         fs.writeFileSync(scriptPath, script);
 
         console.log(`[CLI] Executing snippet: ${snippet}`);
 
-        const { stdout, stderr } = await execPromise(`${CLARINET_CMD} console < repl_input.clar`, { cwd: projectDir });
-        const combinedOutput = stdout + (stderr || "");
-        const lines = combinedOutput.split('\n');
+        const { stdout, stderr } = await execPromise(`${CLARINET_CMD} console < repl_input.clar`, { cwd: workspaceDir });
+        const rawOutput = stdout + (stderr || "");
+        const cleanCombined = rawOutput.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, ''); // Improved ANSI stripping
+        const lines = cleanCombined.split('\n');
 
         let result = "Expression executed.";
-        if (combinedOutput.includes('error:')) {
-            const errorMatch = combinedOutput.match(/error: .+/g);
+        if (cleanCombined.includes('error:')) {
+            const errorMatch = cleanCombined.match(/error: .+/g);
             result = errorMatch ? errorMatch[errorMatch.length - 1] : "Error occurred";
         } else {
-            const snippetLine = lines.findIndex(l => l.includes(`>> ${snippet}`));
-            if (snippetLine !== -1 && lines[snippetLine + 1]) {
-                result = lines[snippetLine + 1].trim();
+            // Find the index of the prompt for the CURRENT snippet (search from end)
+            const snippetPrompt = `>> ${snippet}`;
+            let promptIdx = -1;
+            for (let i = lines.length - 1; i >= 0; i--) {
+                if (lines[i].includes(snippetPrompt)) {
+                    promptIdx = i;
+                    break;
+                }
+            }
+
+            if (promptIdx !== -1) {
+                // Find where the next prompt or asset summary starts (end of our result block)
+                let endIdx = lines.findIndex((l, idx) => idx > promptIdx && (l.includes('>>') || l.includes('Asset balance')));
+                if (endIdx === -1) endIdx = lines.length;
+
+                // Capture all lines in this command's response block
+                const outputBlock = lines.slice(promptIdx + 1, endIdx)
+                    .map(l => l.trim())
+                    .filter(l => l &&
+                        !l.startsWith('>>') &&
+                        !l.includes('---') &&
+                        !l.includes('===') &&
+                        !l.startsWith('$') &&
+                        !l.includes('clarinetrc.toml') &&
+                        !l.includes('hints can be disabled') &&
+                        !l.toLowerCase().startsWith('tip:') &&
+                        !l.toLowerCase().startsWith('hint:'));
+
+                result = outputBlock.join('\n') || "Success";
             } else {
-                const outputLines = lines.filter(l => l.trim().length > 0 && !l.startsWith('>>') && !l.includes('Clarinet') && !l.includes('Asset balance'));
+                // Fallback: get the last non-boilerplate line
+                const outputLines = lines.filter(l => {
+                    const t = l.trim();
+                    return t.length > 0 &&
+                        !t.startsWith('>>') &&
+                        !t.includes('Clarinet') &&
+                        !t.includes('Asset balance') &&
+                        !/^[-=]{3,}$/.test(t) &&
+                        !t.startsWith('$') &&
+                        !t.includes('clarinetrc.toml') &&
+                        !t.includes('hints can be disabled') &&
+                        !t.toLowerCase().startsWith('tip:') &&
+                        !t.toLowerCase().startsWith('hint:') &&
+                        !t.includes('Connected to');
+                });
                 result = outputLines[outputLines.length - 1] || "Success";
             }
         }
@@ -171,24 +338,25 @@ app.post('/ide-api/clarity/execute', async (req, res) => {
         });
     } catch (error: any) {
         res.status(500).json({ success: false, error: error.message });
-    } finally {
-        if (projectDir) fs.rmSync(projectDir, { recursive: true, force: true });
     }
 });
 
 // 5. Get State (Simulated via clarinet console)
 app.post('/ide-api/clarity/state', async (req, res) => {
-    const { contractName } = req.body;
-    let projectDir = '';
-    try {
-        const contracts = activeContract ? [activeContract] : [];
-        projectDir = await createTempProject(contracts);
+    const { contractName, sessionId } = req.body;
+    if (!sessionId) return res.status(400).json({ error: 'Missing sessionId' });
 
+    const workspaceDir = getWorkspacePath(sessionId);
+    if (!fs.existsSync(workspaceDir)) {
+        return res.status(404).json({ error: 'Workspace expired. Please run a full sync.' });
+    }
+
+    try {
         const script = '::get_assets\n';
-        const scriptPath = path.join(projectDir, 'state_input.clar');
+        const scriptPath = path.join(workspaceDir, 'state_input.clar');
         fs.writeFileSync(scriptPath, script);
 
-        const { stdout } = await execPromise(`${CLARINET_CMD} console < state_input.clar`, { cwd: projectDir });
+        const { stdout } = await execPromise(`${CLARINET_CMD} console < state_input.clar`, { cwd: workspaceDir });
 
         const lines = stdout.split('\n');
         const state: any[] = [];
@@ -210,19 +378,20 @@ app.post('/ide-api/clarity/state', async (req, res) => {
         });
     } catch (error: any) {
         res.status(500).json({ success: false, error: error.message });
-    } finally {
-        if (projectDir) fs.rmSync(projectDir, { recursive: true, force: true });
     }
 });
 
 // 6. Terminal Execution (Generic clarinet command)
 app.post('/ide-api/clarity/terminal', async (req, res) => {
-    const { command } = req.body;
-    let projectDir = '';
-    try {
-        const contracts = activeContract ? [activeContract] : [];
-        projectDir = await createTempProject(contracts);
+    const { command, sessionId } = req.body;
+    if (!sessionId) return res.status(400).json({ error: 'Missing sessionId' });
 
+    const workspaceDir = getWorkspacePath(sessionId);
+    if (!fs.existsSync(workspaceDir)) {
+        return res.status(404).json({ error: 'Workspace expired. Please run a full sync.' });
+    }
+
+    try {
         console.log(`[CLI] Terminal command: ${command}`);
 
         if (!command.trim().startsWith('clarinet')) {
@@ -230,7 +399,7 @@ app.post('/ide-api/clarity/terminal', async (req, res) => {
         }
 
         const finalCommand = command.replace(/^clarinet/, CLARINET_CMD);
-        const { stdout, stderr } = await execPromise(finalCommand, { cwd: projectDir });
+        const { stdout, stderr } = await execPromise(finalCommand, { cwd: workspaceDir });
         res.json({
             success: true,
             output: stdout + (stderr || "")
@@ -240,8 +409,6 @@ app.post('/ide-api/clarity/terminal', async (req, res) => {
             success: false,
             output: (error.stdout || "") + (error.stderr || "") || error.message
         });
-    } finally {
-        if (projectDir) fs.rmSync(projectDir, { recursive: true, force: true });
     }
 });
 
@@ -592,6 +759,31 @@ app.post('/ide-api/github/gist', async (req, res) => {
         res.status(500).json({ success: false, error: error.message });
     }
 });
+
+setInterval(() => {
+    const tmpDir = os.tmpdir();
+    fs.readdir(tmpDir, (err, files) => {
+        if (err) return console.error('Sweeper error reading temp dir:', err);
+
+        const now = Date.now();
+
+        files.forEach(file => {
+            if (file.startsWith(WORKSPACE_PREFIX)) {
+                const fullPath = path.join(tmpDir, file);
+
+                fs.stat(fullPath, (err, stats) => {
+                    if (err) return;
+
+                    if (now - stats.mtimeMs > MAX_IDLE_TIME_MS) {
+                        fs.rm(fullPath, { recursive: true, force: true }, (err) => {
+                            if (!err) console.log(`[Sweeper] Cleaned up idle workspace: ${file}`);
+                        });
+                    }
+                });
+            }
+        });
+    });
+}, 5 * 60 * 1000); // Run the sweeper every 5 minutes
 
 app.listen(PORT, () => {
     console.log(`\x1b[32m🚀 Clarinet CLI Backend running at http://localhost:${PORT}\x1b[0m`);
